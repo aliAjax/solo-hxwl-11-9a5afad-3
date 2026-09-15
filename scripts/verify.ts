@@ -5,11 +5,15 @@ import { MockServer } from "../src/review/server";
 import { ReviewStore } from "../src/review/store";
 import {
   CLIENT_KEY,
+  LOCK_KEY,
   SERVER_KEY,
   loadJSON,
+  loadLocalData,
   loadState,
+  localKey,
   memoryKV,
   saveJSON,
+  saveLocalData,
   saveState,
   sharedMemoryKV,
 } from "../src/review/storage";
@@ -269,12 +273,13 @@ async function main(): Promise<void> {
       serverBeforeReload.items.find((i) => i.id === "rv-032")!.status === "open" &&
       Object.keys(serverBeforeReload.processedActions).length === 0);
 
-    const snap = loadJSON<{ outbox: unknown[] }>(kv, CLIENT_KEY)!;
-    check("客户端快照已持久化 outbox（3 条）", Array.isArray(snap.outbox) && snap.outbox.length === 3);
+    const local = loadLocalData(kv, store1.clientId)!;
+    check("本标签数据已持久化 outbox（3 条）",
+      Array.isArray(local.outbox) && local.outbox.length === 3);
 
-    // 刷新：全新 server/store 实例（模拟页面重开，此时网络仍未恢复）
+    // 刷新：全新 server/store 实例（同一标签复用 clientId，此时网络仍未恢复）
     const server2 = new MockServer(kv, { latencyMs: 0 });
-    const store2 = new ReviewStore(server2, kv);
+    const store2 = new ReviewStore(server2, kv, { clientId: store1.clientId });
     await store2.setOnline(false);
     check("刷新后即时恢复：确认态可见",
       store2.getView().state.items.find((i) => i.id === "rv-032")!.status === "confirmed");
@@ -466,8 +471,9 @@ async function main(): Promise<void> {
   console.log("\n[F3] 断网排队 + 刷新恢复 + 重放：同内容冲突不重复");
   {
     const kv = memoryKV();
+    // srv1/st1 是同一标签，给固定 id，刷新后复用
     const srv1 = new MockServer(kv, { latencyMs: 0 });
-    const st1 = new ReviewStore(srv1, kv);
+    const st1 = new ReviewStore(srv1, kv, { clientId: "tab-d" });
     await st1.setOnline(false);
     const m = "离线轴位冲突";
     const d = "OD 轴位 10° → 12°（离线场景）";
@@ -476,9 +482,9 @@ async function main(): Promise<void> {
     check("离线第二次同内容不进队列（本地即去重）", st1.getView().outboxCount === 1,
       st1.getView().outboxCount);
 
-    // 模拟刷新（新实例，仍离线）
+    // 模拟刷新（新实例，仍离线；同一标签复用 clientId）
     const srv2 = new MockServer(kv, { latencyMs: 0 });
-    const st2 = new ReviewStore(srv2, kv);
+    const st2 = new ReviewStore(srv2, kv, { clientId: "tab-d" });
     await st2.setOnline(false);
     const itemReload = st2.getView().state.items.find((i) => i.id === "rv-207")!;
     check("刷新后仍只有 1 条同内容未关闭冲突",
@@ -705,6 +711,312 @@ async function main(): Promise<void> {
       "m2"
     );
     check("迁移后的客户端可正常登记冲突", r2.ok === true);
+  }
+
+  // ───── I. 多轮并发：两标签反复同时提交不同决定，无丢失无重复 ─────
+  console.log("\n[I] 两标签 12 轮反复并发不同决定：全部顺序落库、无丢失/重复，处理人时间真实");
+  {
+    const bus = sharedMemoryKV();
+    const kvA = bus.connect();
+    const kvB = bus.connect();
+    const tabA = new ReviewStore(new MockServer(kvA, { latencyMs: 0 }), kvA);
+    const tabB = new ReviewStore(new MockServer(kvB, { latencyMs: 0 }), kvB);
+
+    const ROUNDS = 12;
+    const promises: Promise<unknown>[] = [];
+    for (let i = 0; i < ROUNDS; i++) {
+      const t = `2026-09-15T13:${String(i).padStart(2, "0")}:00.000Z`;
+      // A 验光师：每轮登记一条不同指标的冲突
+      promises.push(
+        tabA.dispatch(
+          act("mark_conflict", opt, "rv-207", {
+            actionId: `multi-A-${i}`,
+            at: t,
+            metric: `A 轮次指标 ${i}`,
+            detail: `A 第 ${i} 轮说明`,
+          }),
+          `multi-A-${i}`
+        )
+      );
+      // B 验光师2：也登记不同指标（两条必须同时存在）
+      promises.push(
+        tabB.dispatch(
+          act("mark_conflict", opt2, "rv-207", {
+            actionId: `multi-B-${i}`,
+            at: `2026-09-15T13:${String(i).padStart(2, "0")}:30.000Z`,
+            metric: `B 轮次指标 ${i}`,
+            detail: `B 第 ${i} 轮说明`,
+          }),
+          `multi-B-${i}`
+        )
+      );
+      // 每两对并发之间只等很短，让泵自然串行，不强制对齐
+      await Promise.all(promises.slice(-2));
+      await new Promise((r) => setTimeout(r, 5));
+    }
+    await Promise.all(promises);
+    await new Promise((r) => setTimeout(r, 60));
+
+    const serverItem = new MockServer(kvA, { latencyMs: 0 })
+      .getState().items.find((i) => i.id === "rv-207")!;
+    check(`服务端汇聚全部 ${ROUNDS * 2} 条不同冲突（无丢失）`,
+      serverItem.conflicts.length === ROUNDS * 2, serverItem.conflicts.length);
+    const marks = serverItem.audit.filter((a) => a.kind === "mark_conflict");
+    check(`标记审计恰好 ${ROUNDS * 2} 条（无重复）`, marks.length === ROUNDS * 2, marks.length);
+    check("审计 id 全局唯一（无跨标签计数碰撞）",
+      new Set(serverItem.audit.map((a) => a.id)).size === serverItem.audit.length);
+
+    // 处理人与时间逐条核对
+    let actorsOk = true;
+    for (let i = 0; i < ROUNDS; i++) {
+      const aEntry = marks.find((a) => a.summary === `标记冲突：A 轮次指标 ${i}`)!;
+      const bEntry = marks.find((a) => a.summary === `标记冲突：B 轮次指标 ${i}`)!;
+      if (
+        !aEntry || aEntry.userName !== "王验光" ||
+        aEntry.at !== `2026-09-15T13:${String(i).padStart(2, "0")}:00.000Z` ||
+        !bEntry || bEntry.userName !== "陈验光" ||
+        bEntry.at !== `2026-09-15T13:${String(i).padStart(2, "0")}:30.000Z`
+      ) {
+        actorsOk = false;
+      }
+    }
+    check("每条决定处理人/时间与真实提交者一致", actorsOk);
+
+    // rev：每次提交严格 +1，无覆盖写
+    const rev = new MockServer(kvA, { latencyMs: 0 }).getState().rev;
+    check("rev 严格等于提交次数（顺序落库）", rev === ROUNDS * 2, rev);
+
+    // 两标签视图与服务端一致（无 pending 残留）
+    const viewA = tabA.getView().state.items.find((i) => i.id === "rv-207")!;
+    const viewB = tabB.getView().state.items.find((i) => i.id === "rv-207")!;
+    check("两标签 outbox 均排空",
+      tabA.getView().outboxCount === 0 && tabB.getView().outboxCount === 0);
+    check("两标签视图冲突数与服务端一致",
+      viewA.conflicts.length === ROUNDS * 2 && viewB.conflicts.length === ROUNDS * 2);
+    check("两标签视图无待同步标记",
+      viewA.audit.every((a) => !a.pendingSync) && viewB.audit.every((a) => !a.pendingSync));
+  }
+
+  // I2. 高竞争：一次性 20 条不同决定无间隔并发
+  console.log("\n[I2] 20 条不同决定同毫秒并发：全部落库，顺序由存储锁保证");
+  {
+    const bus = sharedMemoryKV();
+    const kvA = bus.connect();
+    const kvB = bus.connect();
+    const tabA = new ReviewStore(new MockServer(kvA, { latencyMs: 0 }), kvA);
+    const tabB = new ReviewStore(new MockServer(kvB, { latencyMs: 0 }), kvB);
+    const all: Promise<unknown>[] = [];
+    for (let i = 0; i < 10; i++) {
+      all.push(tabA.dispatch(
+        act("mark_conflict", opt, "rv-144", {
+          actionId: `burst-A-${i}`, metric: `突发A${i}`, detail: "x",
+        }),
+        `bA${i}`
+      ));
+      all.push(tabB.dispatch(
+        act("mark_conflict", opt2, "rv-144", {
+          actionId: `burst-B-${i}`, metric: `突发B${i}`, detail: "y",
+        }),
+        `bB${i}`
+      ));
+    }
+    const rs = await Promise.all(all);
+    await new Promise((r) => setTimeout(r, 80));
+    check("20 条并发全部返回受理", rs.every((r) => (r as { ok: boolean }).ok));
+    const item = new MockServer(kvA, { latencyMs: 0 }).getState()
+      .items.find((i) => i.id === "rv-144")!;
+    const burstConflicts = item.conflicts.filter((c) => /突发[AB]\d/.test(c.metric));
+    check("服务端 20 条冲突都在（无丢失）", burstConflicts.length === 20, burstConflicts.length);
+    check("20 条审计都在（无重复）",
+      item.audit.filter((a) => /标记冲突：突发[AB]\d/.test(a.summary)).length === 20);
+    check("rev=20（零覆盖写）",
+      new MockServer(kvA, { latencyMs: 0 }).getState().rev === 20);
+  }
+
+  // I3. 同 actionId 跨标签并发：只生效一次
+  console.log("\n[I3] 同 actionId 跨标签并发；同内容冲突跨标签并发：各只一次");
+  {
+    const bus = sharedMemoryKV();
+    const kvA = bus.connect();
+    const kvB = bus.connect();
+    const tabA = new ReviewStore(new MockServer(kvA, { latencyMs: 0 }), kvA);
+    const tabB = new ReviewStore(new MockServer(kvB, { latencyMs: 0 }), kvB);
+    // 同 actionId 的两个实例（A、B 各自本地都通过）
+    const shared: Partial<ReviewAction> = {
+      actionId: "shared-id-1", metric: "同ID指标", detail: "同ID说明",
+    };
+    const [rA, rB] = await Promise.all([
+      tabA.dispatch(act("mark_conflict", opt, "rv-207", shared), "sh1"),
+      tabB.dispatch(act("mark_conflict", opt, shared), "sh2"),
+    ]);
+    await new Promise((r) => setTimeout(r, 60));
+    check("同 actionId：恰好一条受理",
+      [rA.ok, rB.ok].filter(Boolean).length === 1, { rA, rB });
+    const item = new MockServer(kvA, { latencyMs: 0 }).getState()
+      .items.find((i) => i.id === "rv-207")!;
+    check("同 actionId：服务端仅 1 条冲突 1 条审计",
+      item.conflicts.filter((c) => c.metric === "同ID指标").length === 1 &&
+      item.audit.filter((a) => a.summary.includes("同ID指标")).length === 1);
+  }
+
+  // ───── J. 锁故障：崩溃标签遗留陈旧锁、等待超时，均不永久阻塞 ─────
+  console.log("\n[J] 陈旧锁 TTL 接管 / 等待超时入队重试 / 发送中关闭标签");
+  {
+    // J1 崩溃标签遗留陈旧锁
+    const kv = memoryKV();
+    const server = new MockServer(kv, {
+      latencyMs: 0,
+      lock: { ttlMs: 50, waitMs: 500, retryMs: 10 },
+    });
+    kv.setItem(LOCK_KEY, JSON.stringify({ owner: "dead-tab-owner", at: Date.now() - 5_000 }));
+    const r = await server.dispatch(act("to_escalated", doctor, "rv-207", { actionId: "j1" }));
+    check("陈旧锁（已过 TTL）可被接管，提交正常", r.deduped === false);
+    check("提交后陈旧锁被新主释放", kv.getItem(LOCK_KEY) === null);
+
+    // J2 活跃的他人锁：等待超时 → LOCK_BUSY，动作不丢，稍后重试成功
+    const kv2 = memoryKV();
+    const server2 = new MockServer(kv2, {
+      latencyMs: 0,
+      lock: { ttlMs: 10_000, waitMs: 120, retryMs: 20 },
+    });
+    kv2.setItem(LOCK_KEY, JSON.stringify({ owner: "other-live", at: Date.now() }));
+    let busy = false;
+    try {
+      await server2.dispatch(act("to_escalated", doctor, "rv-207", { actionId: "j2" }));
+    } catch (e) {
+      busy = (e as ReviewError).code === "LOCK_BUSY";
+    }
+    check("锁等待超时返回 LOCK_BUSY（不永久挂起）", busy);
+    check("LOCK_BUSY 期间服务端状态未被污染",
+      server2.getState().items.find((i) => i.id === "rv-207")!.status === "open");
+
+    // 通过 store：锁忙时动作进 outbox，锁释放后自动重试落库（不丢失）
+    const store = new ReviewStore(server2, kv2);
+    const res = await store.dispatch(
+      act("to_escalated", doctor, "rv-207", { actionId: "j3" }),
+      "j3"
+    );
+    check("锁忙时提交被受理（已排队）", res.ok === true);
+    check("锁忙时动作保留在 outbox", store.getView().outboxCount === 1);
+    kv2.removeItem(LOCK_KEY); // 持锁标签恢复/释放
+    await store.flushed();
+    // 等待自动退避重试
+    await new Promise((r) => setTimeout(r, 700));
+    check("锁释放后排队动作自动落库（无丢失）",
+      server2.getState().items.find((i) => i.id === "rv-207")!.status === "escalated");
+    check("落库后 outbox 排空", store.getView().outboxCount === 0);
+
+    // J3 发送前"标签关闭"：动作已先持久化在本标签 outbox 键，失活后由新标签接管补传
+    const bus = sharedMemoryKV();
+    const kvC = bus.connect();
+    const tabC = new ReviewStore(new MockServer(kvC, { latencyMs: 0 }), kvC, {
+      clientId: "tab-ghost",
+    });
+    await tabC.setOnline(false);
+    await tabC.dispatch(
+      act("mark_conflict", opt, "rv-207", {
+        actionId: "ghost-1", metric: "关闭前排队", detail: "发送前已持久化",
+      }),
+      "ghost1"
+    );
+    tabC.closeClient(); // 模拟标签被直接关闭：心跳停止，本地键保留
+    const persisted = loadLocalData(kvC, "tab-ghost")!;
+    check("离线动作在发送前已写入本标签 outbox 键",
+      persisted.outbox.some((q) => q.action.actionId === "ghost-1"));
+    // 心跳回退到 10 秒前，模拟该标签已失活超过接管阈值
+    saveLocalData(kvC, { ...persisted, heartbeat: Date.now() - 10_000 });
+
+    // 新标签打开：构造时扫描并接管失活队列（网络已恢复）
+    const kvD = bus.connect();
+    const srvD = new MockServer(kvD, { latencyMs: 0 });
+    const tabD = new ReviewStore(srvD, kvD, { clientId: "tab-savior" });
+    await tabD.setOnline(true);
+    await tabD.flushed();
+    await new Promise((r) => setTimeout(r, 80));
+    check("新标签自动接管并补传关闭前动作，服务端仅 1 条",
+      srvD.getState().items.find((i) => i.id === "rv-207")!.conflicts
+        .filter((c) => c.metric === "关闭前排队").length === 1);
+    check("接管后失活标签的本地键已删除（不会被重复接管）",
+      kvC.getItem(localKey("tab-ghost")) === null);
+    check("接管者 outbox 排空", tabD.getView().outboxCount === 0);
+  }
+
+  // ───── K. 多轮并发后的刷新一致性 ─────
+  console.log("\n[K] 多轮并发后刷新：两新实例与服务端完全一致");
+  {
+    const bus = sharedMemoryKV();
+    const kvA = bus.connect();
+    const kvB = bus.connect();
+    const tabA = new ReviewStore(new MockServer(kvA, { latencyMs: 0 }), kvA);
+    const tabB = new ReviewStore(new MockServer(kvB, { latencyMs: 0 }), kvB);
+    for (let i = 0; i < 6; i++) {
+      await Promise.all([
+        tabA.dispatch(act("mark_conflict", opt, "rv-207", {
+          actionId: `k-A-${i}`, metric: `K甲${i}`, detail: "a",
+        }), `kA${i}`),
+        tabB.dispatch(act("mark_conflict", opt2, "rv-207", {
+          actionId: `k-B-${i}`, metric: `K乙${i}`, detail: "b",
+        }), `kB${i}`),
+      ]);
+    }
+    await new Promise((r) => setTimeout(r, 60));
+    const serverState = new MockServer(kvA, { latencyMs: 0 }).getState();
+
+    // 两个"新标签"实例（模拟各自刷新）
+    const kvA2 = bus.connect();
+    const kvB2 = bus.connect();
+    const freshA = new ReviewStore(new MockServer(kvA2, { latencyMs: 0 }), kvA2);
+    const freshB = new ReviewStore(new MockServer(kvB2, { latencyMs: 0 }), kvB2);
+    await Promise.all([freshA.flushed(), freshB.flushed()]);
+    const cmp = (s: typeof serverState) => ({
+      rev: s.rev,
+      conflicts: s.items.find((i) => i.id === "rv-207")!.conflicts.length,
+      audits: s.items.find((i) => i.id === "rv-207")!.audit.length,
+    });
+    check("刷新实例 A 与服务端一致（rev/冲突/审计数）",
+      JSON.stringify(cmp(freshA.getView().state)) === JSON.stringify(cmp(serverState)));
+    check("刷新实例 B 与服务端一致",
+      JSON.stringify(cmp(freshB.getView().state)) === JSON.stringify(cmp(serverState)));
+    check("新实例无遗留 outbox/待同步",
+      freshA.getView().outboxCount === 0 && freshB.getView().outboxCount === 0 &&
+      freshA.getView().state.items.find((i) => i.id === "rv-207")!.audit
+        .every((a) => !a.pendingSync));
+  }
+
+  // ───── L. 带网络延迟的多轮并发（贴合浏览器 180ms 延迟） ─────
+  console.log("\n[L] 180ms 网络延迟下两标签 8 轮快速并发：无丢失、无重复、无假性同步");
+  {
+    const bus = sharedMemoryKV();
+    const kvA = bus.connect();
+    const kvB = bus.connect();
+    const tabA = new ReviewStore(new MockServer(kvA, { latencyMs: 180 }), kvA, { clientId: "lat-A" });
+    const tabB = new ReviewStore(new MockServer(kvB, { latencyMs: 180 }), kvB, { clientId: "lat-B" });
+    const ROUNDS = 8;
+    const all: Promise<unknown>[] = [];
+    for (let i = 0; i < ROUNDS; i++) {
+      all.push(tabA.dispatch(act("mark_conflict", opt, "rv-207", {
+        actionId: `lat-A-${i}`, metric: `延迟甲${i}`, detail: "a",
+      }), `lA${i}`));
+      all.push(tabB.dispatch(act("mark_conflict", opt2, "rv-207", {
+        actionId: `lat-B-${i}`, metric: `延迟乙${i}`, detail: "b",
+      }), `lB${i}`));
+    }
+    await Promise.all(all);
+    await Promise.all([tabA.flushed(), tabB.flushed()]);
+    // 等锁忙退避可能触发的补传完成
+    await new Promise((r) => setTimeout(r, 600));
+    await Promise.all([tabA.flushed(), tabB.flushed()]);
+
+    const final = new MockServer(kvA, { latencyMs: 0 }).getState();
+    const item = final.items.find((i) => i.id === "rv-207")!;
+    check(`180ms 延迟下 ${ROUNDS * 2} 条决定全部落库（无丢失）`,
+      item.conflicts.length === ROUNDS * 2, item.conflicts.length);
+    const marks = item.audit.filter((a) => a.kind === "mark_conflict");
+    check("标记审计无重复", marks.length === ROUNDS * 2, marks.length);
+    check("rev 严格等于提交数", final.rev === ROUNDS * 2, final.rev);
+    check("两标签 outbox 排空、无待同步标记",
+      tabA.getView().outboxCount === 0 && tabB.getView().outboxCount === 0 &&
+      tabA.getView().state.items.find((i) => i.id === "rv-207")!.audit.every((a) => !a.pendingSync));
   }
 
   console.log(`\n结果：${passed} 通过，${failed} 失败\n`);

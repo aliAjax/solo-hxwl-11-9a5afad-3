@@ -2,6 +2,7 @@ import { useSyncExternalStore, useMemo, useState } from "react";
 import "./styles.css";
 import { MockServer } from "./review/server";
 import { ReviewStore } from "./review/store";
+import { browserKV } from "./review/storage";
 import { buildCompareRows, detectAlerts } from "./review/diff";
 import { can, denyReason } from "./review/rules";
 import { PATIENTS, USERS } from "./review/seed";
@@ -15,10 +16,23 @@ import type {
 } from "./review/types";
 import { ROLE_LABEL, STATUS_LABEL } from "./review/types";
 
-// 浏览器用 localStorage 持久化（模拟服务端库 + 客户端快照两份）
-const browserKV: Storage = localStorage;
-const server = new MockServer(browserKV, { latencyMs: 180 });
-const store = new ReviewStore(server, browserKV);
+// localStorage 持久化（模拟服务端库 + 各标签本地 outbox；失活标签队列可被接管）
+const browserStorage = browserKV();
+
+// clientId 存 sessionStorage：同一标签刷新后复用，不同标签页天然各自独立
+let clientId = "";
+try {
+  clientId = sessionStorage.getItem("rx-review/client-id") ?? "";
+  if (!clientId) {
+    clientId = `tab-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+    sessionStorage.setItem("rx-review/client-id", clientId);
+  }
+} catch {
+  clientId = `tab-${Date.now().toString(36)}`;
+}
+
+const server = new MockServer(browserStorage, { latencyMs: 180 });
+const store = new ReviewStore(server, browserStorage, { clientId });
 
 function useStore() {
   return useSyncExternalStore(

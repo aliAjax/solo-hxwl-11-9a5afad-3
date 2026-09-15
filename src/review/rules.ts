@@ -8,7 +8,15 @@ import type {
   Role,
 } from "./types";
 import { ReviewError } from "./types";
-import { nextAuditId } from "./seed";
+
+/**
+ * 审计 id 由 actionId 派生：每个动作恰好一条审计，
+ * 跨标签（各自的内存计数相互独立）也不会碰撞。
+ */
+function auditIdFor(action: ReviewAction, suffix = ""): string {
+  const base = `au-${action.actionId.replace(/[^a-z0-9]/gi, "").slice(0, 24)}`;
+  return suffix ? `${base}-${suffix}` : base;
+}
 
 /**
  * 权限矩阵（复核台核心规则）
@@ -129,7 +137,7 @@ export function applyAction(state: ReviewState, action: ReviewAction): ApplyResu
   const actor = action.actor;
 
   const auditBase = (kind: AuditEntry["kind"], summary: string, conflictId?: string): AuditEntry => ({
-    id: nextAuditId(),
+    id: auditIdFor(action),
     at: action.at,
     userId: actor.id,
     userName: actor.name,

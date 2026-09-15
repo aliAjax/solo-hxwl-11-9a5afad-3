@@ -350,6 +350,167 @@ async function main() {
       (await page.locator(".conflict-card.open", { hasText: "迁移后新指标" }).count()) === 1);
   }
 
+  console.log("\n[E10] 两真实标签 5 轮反复并发不同决定：无丢失、无重复、刷新一致");
+  {
+    await page.getByRole("button", { name: "重置演示" }).click();
+    await sleep(300);
+    await page.locator(".item-row", { hasText: "Patient-207" }).click();
+    await page.locator("select").selectOption({ index: 1 }); // 王验光
+
+    const t2 = await context.newPage();
+    await t2.goto(BASE);
+    await t2.waitForSelector(".item-panel");
+    await t2.locator(".item-row", { hasText: "Patient-207" }).first().click();
+    await t2.locator("select").selectOption({ index: 2 }); // 陈验光
+
+    const mark = async (pg, metric, detail) => {
+      await pg.locator(".mark-form input").nth(0).fill(metric);
+      await pg.locator(".mark-form input").nth(1).fill(detail);
+      await pg.getByRole("button", { name: "标记冲突", exact: true }).last().click();
+    };
+
+    const ROUNDS = 5;
+    for (let i = 0; i < ROUNDS; i++) {
+      await Promise.all([
+        mark(page, `多轮甲${i}`, `甲第${i}轮说明`),
+        mark(t2, `多轮乙${i}`, `乙第${i}轮说明`),
+      ]);
+      // 每轮等待两标签视图都汇聚到应有条数（无丢失即必须增长）
+      await page.waitForFunction(
+        (n) => document.querySelectorAll(".conflict-card.open").length >= n,
+        2 * (i + 1),
+        { timeout: 8000 }
+      );
+      await t2.waitForFunction(
+        (n) => document.querySelectorAll(".conflict-card.open").length >= n,
+        2 * (i + 1),
+        { timeout: 8000 }
+      );
+    }
+    await sleep(300);
+
+    const countOn = async (pg, text) =>
+      pg.locator(".conflict-card.open", { hasText: text }).count();
+    let allPresent = true;
+    for (let i = 0; i < ROUNDS; i++) {
+      if ((await countOn(page, `多轮甲${i}`)) !== 1) allPresent = false;
+      if ((await countOn(page, `多轮乙${i}`)) !== 1) allPresent = false;
+    }
+    ok("标签 A：10 条冲突全部存在且各只 1 条（无丢失/重复）", allPresent);
+    ok("标签 B 视图同样汇聚 10 条",
+      (await t2.locator(".conflict-card.open").count()) === 10);
+
+    const auditTexts = await page.locator(".item-panel .audit-item").allInnerTexts();
+    const marks = auditTexts.filter((t) => t.includes("标记冲突：多轮"));
+    ok("标记审计恰好 10 条，无重复", marks.length === 10, marks.length);
+    ok("审计中两位处理人都在",
+      auditTexts.some((t) => t.includes("王验光")) && auditTexts.some((t) => t.includes("陈验光")));
+    ok("两标签 outbox 均已排空（无待同步标记）",
+      (await page.locator(".pending-tag").count()) === 0 &&
+      (await t2.locator(".pending-tag").count()) === 0);
+
+    // 服务端 rev=10
+    const rev = await page.evaluate(() =>
+      JSON.parse(localStorage.getItem("rx-review/server-state/v1")).rev);
+    ok("服务端 rev=10（顺序落库，零覆盖）", rev === 10, rev);
+
+    // 两个标签各自刷新：仍为 10 条、无待同步
+    await Promise.all([page.reload(), t2.reload()]);
+    await Promise.all([page.waitForSelector(".item-panel"), t2.waitForSelector(".item-panel")]);
+    await Promise.all([
+      page.locator(".item-row", { hasText: "Patient-207" }).first().click(),
+      t2.locator(".item-row", { hasText: "Patient-207" }).first().click(),
+    ]);
+    await sleep(400);
+    ok("刷新后两标签仍各见 10 条冲突",
+      (await page.locator(".conflict-card.open").count()) === 10 &&
+      (await t2.locator(".conflict-card.open").count()) === 10);
+    ok("刷新后无待同步残留",
+      (await page.locator(".pending-tag").count()) === 0 &&
+      (await t2.locator(".pending-tag").count()) === 0);
+    await t2.close();
+  }
+
+  console.log("\n[E11] 陈旧锁不永久阻塞；关闭标签遗留队列被新标签接管");
+  {
+    await page.getByRole("button", { name: "重置演示" }).click();
+    await sleep(300);
+    await page.locator(".item-row", { hasText: "Patient-207" }).click();
+    await page.locator("select").selectOption({ index: 1 });
+
+    // 1) 注入一个已过 TTL 的陈旧锁（模拟崩溃标签没释放）
+    await page.evaluate(() => {
+      localStorage.setItem("rx-review/server-lock/v1",
+        JSON.stringify({ owner: "dead-owner", at: Date.now() - 10_000 }));
+    });
+    await page.locator(".mark-form input").nth(0).fill("陈旧锁后提交");
+    await page.locator(".mark-form input").nth(1).fill("应自动接管锁并落库");
+    await page.getByRole("button", { name: "标记冲突", exact: true }).last().click();
+    await sleep(700);
+    ok("陈旧锁被接管，提交正常落库（不永久阻塞）",
+      (await page.locator(".conflict-card.open", { hasText: "陈旧锁后提交" }).count()) === 1);
+    const lockCleared = await page.evaluate(
+      () => localStorage.getItem("rx-review/server-lock/v1") === null);
+    ok("落库后锁已释放", lockCleared);
+
+    // 2) 关闭标签接管：ghost 标签离线排队一条，随后"失活"，新标签打开后接管补传
+    const ghost = await context.newPage();
+    await ghost.goto(BASE);
+    await ghost.waitForSelector(".item-panel");
+    await ghost.locator(".item-row", { hasText: "Patient-207" }).first().click();
+    await ghost.locator("select").selectOption({ index: 2 }); // 陈验光
+    await ghost.getByRole("button", { name: /在线/ }).click(); // 断网
+    await ghost.waitForSelector("button.net.offline");
+    await ghost.locator(".mark-form input").nth(0).fill("幽灵标签遗留");
+    await ghost.locator(".mark-form input").nth(1).fill("关闭后应由新标签接管");
+    await ghost.getByRole("button", { name: "标记冲突", exact: true }).last().click();
+    await sleep(300);
+
+    // 把 ghost 标签的本地键心跳改为 10 秒前（模拟已关闭失活）
+    await ghost.evaluate(() => {
+      const prefix = "rx-review/client/v2#";
+      for (let i = 0; i < localStorage.length; i++) {
+        const k = localStorage.key(i);
+        if (k && k.startsWith(prefix)) {
+          const d = JSON.parse(localStorage.getItem(k));
+          d.heartbeat = Date.now() - 10_000;
+          localStorage.setItem(k, JSON.stringify(d));
+        }
+      }
+    });
+    await ghost.close(); // 标签真正关闭
+
+    // 新标签打开（全局仍离线），构造时即接管失活队列；再手动恢复网络触发补传
+    const savior = await context.newPage();
+    await savior.goto(BASE);
+    await savior.waitForSelector(".item-panel");
+    await sleep(300); // 等接管扫描（构造时执行一次）
+    await savior.getByRole("button", { name: /断网模拟中/ }).click();
+    await savior.waitForSelector("button.net.online", { timeout: 5000 });
+    await sleep(1000); // 等接管动作锁内落库
+    await savior.locator(".item-row", { hasText: "Patient-207" }).first().click();
+    await sleep(300);
+    ok("新标签接管关闭标签遗留决定并补传，服务端仅 1 条",
+      (await savior.locator(".conflict-card.open", { hasText: "幽灵标签遗留" }).count()) === 1);
+    ok("接管后无待同步残留",
+      (await savior.locator(".pending-tag").count()) === 0);
+    const leftover = await savior.evaluate(() => {
+      const prefix = "rx-review/client/v2#";
+      let found = 0;
+      for (let i = 0; i < localStorage.length; i++) {
+        const k = localStorage.key(i);
+        if (k && k.startsWith(prefix)) {
+          const d = JSON.parse(localStorage.getItem(k));
+          if ((d.outbox || []).some((q) => q.action.metric === "幽灵标签遗留")) found++;
+        }
+      }
+      return found;
+    });
+    ok("遗留动作已从所有标签 outbox 摘除（失活键被清理，不会重复接管）",
+      leftover === 0, leftover);
+    await savior.close();
+  }
+
   ok("全程无页面 JS 异常", errors.length === 0, errors);
 
   await browser.close();

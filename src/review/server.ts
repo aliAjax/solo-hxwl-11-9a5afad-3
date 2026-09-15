@@ -2,6 +2,8 @@ import { applyAction } from "./rules";
 import { seedState } from "./seed";
 import {
   KV,
+  LOCK_KEY,
+  LockOptions,
   SETTINGS_KEY,
   SERVER_KEY,
   loadJSON,
@@ -32,10 +34,12 @@ export class MockServer {
   private owner: string;
   online = true;
   latencyMs: number;
+  lock: LockOptions;
 
-  constructor(kv: KV, opts: { latencyMs?: number } = {}) {
+  constructor(kv: KV, opts: { latencyMs?: number; lock?: LockOptions } = {}) {
     this.kv = kv;
     this.latencyMs = opts.latencyMs ?? 120;
+    this.lock = opts.lock ?? {};
     this.owner = `srv-${++ownerSeq}-${Math.random().toString(36).slice(2, 7)}`;
 
     if (!loadState(kv, SERVER_KEY)) {
@@ -63,6 +67,7 @@ export class MockServer {
     this.online = true;
     saveState(this.kv, SERVER_KEY, fresh);
     saveJSON(this.kv, SETTINGS_KEY, { online: true });
+    this.kv.removeItem(LOCK_KEY); // 演示重置时一并清理可能残留的锁
     return fresh;
   }
 
@@ -81,22 +86,27 @@ export class MockServer {
     await this.delay();
     if (!this.online) throw new ReviewError("NETWORK_OFFLINE", "网络已断开，动作暂存本地");
 
-    return withServerLock(this.kv, this.owner, () => {
-      // 临界区内重新读取：拿到的是其它标签刚刚落库的最新状态
-      const current = loadState(this.kv, SERVER_KEY) ?? seedState();
+    return withServerLock(
+      this.kv,
+      this.owner,
+      () => {
+        // 临界区内重新读取：拿到的是其它标签刚刚落库的最新状态
+        const current = loadState(this.kv, SERVER_KEY) ?? seedState();
 
-      if (current.processedActions[action.actionId]) {
-        return { state: current, deduped: true };
-      }
+        if (current.processedActions[action.actionId]) {
+          return { state: current, deduped: true };
+        }
 
-      const result = applyAction(current, action);
-      const next: ReviewState = { ...result.state, rev: current.rev + 1 };
-      saveState(this.kv, SERVER_KEY, next);
-      return {
-        state: next,
-        deduped: false,
-        conflictDeduped: result.outcome === "conflict_deduped",
-      };
-    });
+        const result = applyAction(current, action);
+        const next: ReviewState = { ...result.state, rev: current.rev + 1 };
+        saveState(this.kv, SERVER_KEY, next);
+        return {
+          state: next,
+          deduped: false,
+          conflictDeduped: result.outcome === "conflict_deduped",
+        };
+      },
+      this.lock
+    );
   }
 }
