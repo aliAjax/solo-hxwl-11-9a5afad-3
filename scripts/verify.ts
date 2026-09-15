@@ -3,8 +3,16 @@ import { applyAction } from "../src/review/rules";
 import { seedState, USERS } from "../src/review/seed";
 import { MockServer } from "../src/review/server";
 import { ReviewStore } from "../src/review/store";
-import { memoryKV } from "../src/review/storage";
-import { CLIENT_KEY, SERVER_KEY, loadJSON, loadState } from "../src/review/storage";
+import {
+  CLIENT_KEY,
+  SERVER_KEY,
+  loadJSON,
+  loadState,
+  memoryKV,
+  saveJSON,
+  saveState,
+  sharedMemoryKV,
+} from "../src/review/storage";
 import type { ActionType, ReviewAction, ReviewError, ReviewState } from "../src/review/types";
 
 const doctor = USERS[0]; // 林复查
@@ -155,7 +163,7 @@ async function main(): Promise<void> {
     const s = seedState();
     const confirmed = applyAction(
       s, act("confirm", doctor, "rv-144") // rv-144 冲突已关闭
-    );
+    ).state;
     check("引擎：冲突全关的事项可确认",
       confirmed.items.find((i) => i.id === "rv-144")!.status === "confirmed");
     check("引擎：确认后关闭冲突被拒 ILLEGAL_TRANSITION",
@@ -170,7 +178,7 @@ async function main(): Promise<void> {
     // C1 引擎层 actionId 去重
     const s0 = seedState();
     const a = act("to_escalated", doctor, "rv-207", { actionId: "dup-1" });
-    const s1 = applyAction(s0, a);
+    const s1 = applyAction(s0, a).state;
     check("引擎：相同 actionId 再放 → DUPLICATE_ACTION",
       expectEngineCode(s1, a, "DUPLICATE_ACTION"));
     check("引擎：去重后审计不增加",
@@ -326,6 +334,377 @@ async function main(): Promise<void> {
     check("新实例恢复审计（处理人林复查）",
       after.getView().state.items.find((i) => i.id === "rv-207")!.audit
         .some((a) => a.kind === "to_pending_fix" && a.userName === "林复查"));
+  }
+
+  // ───────── F. 冲突内容级幂等：同指标同说明只留一条 ─────────
+  console.log("\n[F] 同指标同说明冲突：跨 actionId/刷新/断网重放只保留一条未关闭冲突+一条审计");
+  {
+    const { store, itemOf } = setup();
+    const m = "右眼球镜差异";
+    const d = "2026-06-12 -2.25 → 2026-09-11 -2.75，变化 -0.50D";
+
+    const r1 = await store.dispatch(
+      act("mark_conflict", opt, "rv-207", { actionId: "f-a1", metric: m, detail: d }),
+      "f1"
+    );
+    const r2 = await store.dispatch(
+      act("mark_conflict", opt, "rv-207", { actionId: "f-a2", metric: m, detail: d }),
+      "f2"
+    );
+    check("首次登记成功，相同内容第二次被内容幂等拒绝",
+      r1.ok === true && r2.ok === false && r2.code === "DUPLICATE_CONFLICT", { r1, r2 });
+    let item = itemOf("rv-207");
+    const openSame = item.conflicts.filter((c) => c.status === "open" && c.metric === m);
+    check("只保留 1 条未关闭冲突", openSame.length === 1, openSame);
+    check("只产生 1 条标记审计",
+      item.audit.filter((a) => a.kind === "mark_conflict" && a.summary.includes(m)).length === 1);
+
+    // 空白差异不影响判定
+    const r3 = await store.dispatch(
+      act("mark_conflict", opt2, "rv-207", {
+        actionId: "f-a3",
+        metric: `  ${m} `,
+        detail: `${d}\n`,
+      }),
+      "f3"
+    );
+    check("仅首尾空白差异仍判为同一冲突", r3.code === "DUPLICATE_CONFLICT", r3);
+
+    // 不同指标可登记
+    const r4 = await store.dispatch(
+      act("mark_conflict", opt, "rv-207", { actionId: "f-a4", metric: "左眼轴位差异", detail: d }),
+      "f4"
+    );
+    check("不同指标可以登记", r4.ok === true);
+    item = itemOf("rv-207");
+    check("未关闭冲突变为 2 条",
+      item.conflicts.filter((c) => c.status === "open").length === 2);
+
+    // 同指标但不同说明，也可以登记
+    const r5 = await store.dispatch(
+      act("mark_conflict", opt, "rv-207", {
+        actionId: "f-a5",
+        metric: m,
+        detail: "另一次复查：2026-03-10 → 2026-06-12 变化 -0.25D",
+      }),
+      "f5"
+    );
+    check("同指标不同说明可以登记", r5.ok === true);
+    check("未关闭冲突变为 3 条",
+      itemOf("rv-207").conflicts.filter((c) => c.status === "open").length === 3);
+  }
+
+  // F2. 已关闭冲突 → 相同内容新建被拒，必须显式重开
+  console.log("\n[F2] 已关闭的相同冲突需显式重新开启");
+  {
+    const kv = memoryKV();
+    const server = new MockServer(kv, { latencyMs: 0 });
+    const store = new ReviewStore(server, kv);
+    const m = "PD 瞳距差异";
+    const d = "58mm → 60mm，超出 2mm 容差";
+
+    await store.dispatch(act("mark_conflict", opt, "rv-207", {
+      actionId: "g-a1", metric: m, detail: d, at: "2026-09-15T10:00:00.000Z",
+    }), "g1");
+    const cfId = server.getState().items.find((i) => i.id === "rv-207")!.conflicts[0].id;
+    await store.dispatch(act("close_conflict", doctor, "rv-207", {
+      actionId: "g-a2", conflictId: cfId, at: "2026-09-15T10:05:00.000Z",
+    }), "g2");
+
+    const rNew = await store.dispatch(
+      act("mark_conflict", opt, "rv-207", {
+        actionId: "g-a3", metric: m, detail: d, at: "2026-09-15T10:10:00.000Z",
+      }),
+      "g3"
+    );
+    check("对已关闭的同内容冲突再标记 → CONFLICT_RESOLVED（不静默新建）",
+      !rNew.ok && rNew.code === "CONFLICT_RESOLVED", rNew);
+    const afterReject = server.getState().items.find((i) => i.id === "rv-207")!;
+    check("拒绝后冲突仍为 1 条且保持已关闭、无新审计",
+      afterReject.conflicts.length === 1 &&
+      afterReject.conflicts[0].status === "resolved" &&
+      afterReject.audit.filter((a) => a.kind === "mark_conflict").length === 1);
+
+    const rReopen = await store.dispatch(
+      act("reopen_conflict", opt2, "rv-207", {
+        actionId: "g-a4",
+        conflictId: cfId,
+        detail: "换片后复测仍不一致",
+        at: "2026-09-15T10:15:00.000Z",
+      }),
+      "g4"
+    );
+    check("验光师可显式重新开启", rReopen.ok === true);
+    const reopened = server.getState().items.find((i) => i.id === "rv-207")!;
+    check("冲突回到未关闭，且重新开启人/时间更新为本次提交者",
+      reopened.conflicts[0].status === "open" &&
+      reopened.conflicts[0].markedByName === "陈验光" &&
+      reopened.conflicts[0].markedAt !== afterReject.conflicts[0].markedAt);
+    check("重开写有 reopen 审计",
+      reopened.audit.some((a) => a.kind === "reopen_conflict" && a.userName === "陈验光"));
+
+    // 重开后同内容再标 → 再次幂等
+    const rAgain = await store.dispatch(
+      act("mark_conflict", opt, "rv-207", { actionId: "g-a5", metric: m, detail: d }),
+      "g5"
+    );
+    check("重开后同内容再标仍被幂等", rAgain.code === "DUPLICATE_CONFLICT", rAgain);
+
+    // 医生无权重开
+    let blocked = false;
+    try {
+      const s = server.getState();
+      const { applyAction } = await import("../src/review/rules");
+      applyAction(s, act("reopen_conflict", doctor, "rv-207", { conflictId: cfId }));
+    } catch (e) {
+      blocked = (e as ReviewError).code === "FORBIDDEN";
+    }
+    check("医生重新开启冲突 → FORBIDDEN（重开权属验光师）", blocked);
+  }
+
+  // F3. 断网重放与刷新后：同内容冲突仍只有一条
+  console.log("\n[F3] 断网排队 + 刷新恢复 + 重放：同内容冲突不重复");
+  {
+    const kv = memoryKV();
+    const srv1 = new MockServer(kv, { latencyMs: 0 });
+    const st1 = new ReviewStore(srv1, kv);
+    await st1.setOnline(false);
+    const m = "离线轴位冲突";
+    const d = "OD 轴位 10° → 12°（离线场景）";
+    await st1.dispatch(act("mark_conflict", opt, "rv-207", { actionId: "off-1", metric: m, detail: d }), "h1");
+    await st1.dispatch(act("mark_conflict", opt2, "rv-207", { actionId: "off-2", metric: m, detail: d }), "h2");
+    check("离线第二次同内容不进队列（本地即去重）", st1.getView().outboxCount === 1,
+      st1.getView().outboxCount);
+
+    // 模拟刷新（新实例，仍离线）
+    const srv2 = new MockServer(kv, { latencyMs: 0 });
+    const st2 = new ReviewStore(srv2, kv);
+    await st2.setOnline(false);
+    const itemReload = st2.getView().state.items.find((i) => i.id === "rv-207")!;
+    check("刷新后仍只有 1 条同内容未关闭冲突",
+      itemReload.conflicts.filter((c) => c.metric === m && c.status === "open").length === 1);
+
+    await st2.setOnline(true);
+    const finalItem = srv2.getState().items.find((i) => i.id === "rv-207")!;
+    check("重放落库后服务端只有 1 条冲突、1 条标记审计",
+      finalItem.conflicts.filter((c) => c.metric === m).length === 1 &&
+      finalItem.audit.filter((a) => a.kind === "mark_conflict" && a.summary.includes(m)).length === 1);
+  }
+
+  // ───────── G. 跨标签页并发：不同决定都不丢失 ─────────
+  console.log("\n[G] 两个标签页并发提交不同决定：全部落库，处理人/时间真实");
+  {
+    const bus = sharedMemoryKV();
+    const kvA = bus.connect(); // 标签 A
+    const kvB = bus.connect(); // 标签 B
+    const srvA = new MockServer(kvA, { latencyMs: 0 });
+    const srvB = new MockServer(kvB, { latencyMs: 0 });
+    const tabA = new ReviewStore(srvA, kvA);
+    const tabB = new ReviewStore(srvB, kvB);
+
+    const atA = "2026-09-15T11:00:00.000Z";
+    const atB = "2026-09-15T11:00:30.000Z";
+    // A：验光师在 rv-207 标记冲突；B：医生同时把 rv-144… 不，选同一事项验证汇聚——
+    // B 对 rv-207 转需升级（并发不同类型决定）
+    const pA = tabA.dispatch(
+      act("mark_conflict", opt, "rv-207", {
+        actionId: "tab-A-1",
+        at: atA,
+        metric: "并发：右眼球镜",
+        detail: "标签A 验光师王验光登记",
+      }),
+      "A1"
+    );
+    const pB = tabB.dispatch(
+      act("to_escalated", doctor, "rv-207", { actionId: "tab-B-1", at: atB }),
+      "B1"
+    );
+    const [resA, resB] = await Promise.all([pA, pB]);
+    check("两个并发决定都受理", resA.ok && resB.ok, { resA, resB });
+
+    await new Promise((r) => setTimeout(r, 50)); // 等 storage 事件送达
+    const serverState = srvA.getState();
+    const item = serverState.items.find((i) => i.id === "rv-207")!;
+    check("服务端汇聚两个决定：状态=需升级", item.status === "escalated", item.status);
+    check("服务端汇聚两个决定：冲突已登记",
+      item.conflicts.some((c) => c.metric === "并发：右眼球镜" && c.status === "open"));
+    const markEntry = item.audit.find((a) => a.kind === "mark_conflict")!;
+    const escEntry = item.audit.find((a) => a.kind === "to_escalated")!;
+    check("处理人/时间与真实提交者一致（王验光 11:00 / 林复查 11:00:30）",
+      markEntry.userName === "王验光" && markEntry.at === atA &&
+      escEntry.userName === "林复查" && escEntry.at === atB,
+      { markEntry, escEntry });
+    check("rev 已自增两次", serverState.rev >= 2, serverState.rev);
+
+    // 两标签视图都看到对方的决定
+    const viewA = tabA.getView().state.items.find((i) => i.id === "rv-207")!;
+    const viewB = tabB.getView().state.items.find((i) => i.id === "rv-207")!;
+    check("标签 A 视图包含 B 的需升级流转", viewA.status === "escalated");
+    check("标签 B 视图包含 A 登记的冲突",
+      viewB.conflicts.some((c) => c.metric === "并发：右眼球镜"));
+  }
+
+  // G2. 两标签并发登记【不同指标】冲突 → 两条都保留
+  console.log("\n[G2] 两标签并发登记不同冲突：都保留；同内容并发：只一条");
+  {
+    const bus = sharedMemoryKV();
+    const kvA = bus.connect();
+    const kvB = bus.connect();
+    const tabA = new ReviewStore(new MockServer(kvA, { latencyMs: 0 }), kvA);
+    const tabB = new ReviewStore(new MockServer(kvB, { latencyMs: 0 }), kvB);
+
+    const [rA, rB] = await Promise.all([
+      tabA.dispatch(
+        act("mark_conflict", opt, "rv-207", {
+          actionId: "tab-A-2", metric: "并发指标甲", detail: "说明甲",
+        }),
+        "A2"
+      ),
+      tabB.dispatch(
+        act("mark_conflict", opt, "rv-207", {
+          actionId: "tab-B-2", metric: "并发指标乙", detail: "说明乙",
+        }),
+        "B2"
+      ),
+    ]);
+    check("两标签不同冲突都成功", rA.ok && rB.ok, { rA, rB });
+    await new Promise((r) => setTimeout(r, 50));
+    const item = tabA.getView().state.items.find((i) => i.id === "rv-207")!;
+    check("两条不同冲突同时存在",
+      item.conflicts.some((c) => c.metric === "并发指标甲") &&
+      item.conflicts.some((c) => c.metric === "并发指标乙"));
+
+    // 同内容并发（新事项 rv-144，冲突已关闭的种子项；改用 rv-081 上的同指标）
+    const bus2 = sharedMemoryKV();
+    const k1 = bus2.connect();
+    const k2 = bus2.connect();
+    const t1 = new ReviewStore(new MockServer(k1, { latencyMs: 0 }), k1);
+    const t2 = new ReviewStore(new MockServer(k2, { latencyMs: 0 }), k2);
+    const [q1, q2] = await Promise.all([
+      t1.dispatch(
+        act("mark_conflict", opt, "rv-144", {
+          actionId: "same-1", metric: "并发同指标", detail: "完全相同说明",
+        }),
+        "S1"
+      ),
+      t2.dispatch(
+        act("mark_conflict", opt2, "rv-144", {
+          actionId: "same-2", metric: "并发同指标", detail: "完全相同说明",
+        }),
+        "S2"
+      ),
+    ]);
+    check("同内容并发：恰好一个受理、另一个被内容幂等",
+      [q1.ok, q2.ok].filter(Boolean).length === 1, { q1, q2 });
+    await new Promise((r) => setTimeout(r, 50));
+    const sameItem = t1.getView().state.items.find((i) => i.id === "rv-144")!;
+    check("服务端只保留 1 条同内容冲突、1 条审计",
+      sameItem.conflicts.filter((c) => c.metric === "并发同指标").length === 1 &&
+      sameItem.audit.filter((a) => a.summary.includes("并发同指标")).length === 1);
+  }
+
+  // G3. A 离线操作、B 在线操作同一事项，A 恢复后对账，两条决定都不丢
+  console.log("\n[G3] 离线标签与在线标签并发：恢复后 rebase，决定互不覆盖");
+  {
+    const bus = sharedMemoryKV();
+    const kvA = bus.connect();
+    const kvB = bus.connect();
+    const tabA = new ReviewStore(new MockServer(kvA, { latencyMs: 0 }), kvA);
+    const tabB = new ReviewStore(new MockServer(kvB, { latencyMs: 0 }), kvB);
+
+    await tabA.setOnline(false);
+    // A 离线：验光师标记冲突
+    await tabA.dispatch(
+      act("mark_conflict", opt, "rv-207", {
+        actionId: "off-A", metric: "离线标签冲突", detail: "A 断网期间登记",
+        at: "2026-09-15T12:00:00.000Z",
+      }),
+      "OA"
+    );
+    // B 同时在线：医生转待修正（rv-207 无未关闭冲突，合法）
+    await tabB.dispatch(
+      act("to_pending_fix", doctor, "rv-207", {
+        actionId: "on-B", at: "2026-09-15T12:01:00.000Z",
+      }),
+      "OB"
+    );
+    await new Promise((r) => setTimeout(r, 30));
+
+    // A 恢复网络：先对账到 B 的落库状态，再重放自己的冲突
+    await tabA.setOnline(true);
+    await new Promise((r) => setTimeout(r, 50));
+
+    const finalItem = tabA.getView().state.items.find((i) => i.id === "rv-207")!;
+    check("A 恢复后：B 的流转保留（待修正）", finalItem.status === "pending_fix", finalItem.status);
+    check("A 恢复后：A 离线冲突也已落库",
+      finalItem.conflicts.some((c) => c.metric === "离线标签冲突" && c.status === "open"));
+    const offEntry = finalItem.audit.find((a) => a.actionId === undefined && a.kind === "mark_conflict" && a.userName === "王验光");
+    check("A 的审计处理人/时间是本人提交时刻",
+      finalItem.audit.some((a) => a.kind === "mark_conflict" && a.userName === "王验光" &&
+        a.at === "2026-09-15T12:00:00.000Z"),
+      offEntry);
+    check("B 的审计也在",
+      finalItem.audit.some((a) => a.kind === "to_pending_fix" && a.userName === "林复查"));
+    check("A outbox 清空、无待同步标记",
+      tabA.getView().outboxCount === 0 &&
+      finalItem.audit.every((a) => !a.pendingSync));
+
+    // 服务端权威状态一致
+    const serverItem = new MockServer(kvA, { latencyMs: 0 }).getState()
+      .items.find((i) => i.id === "rv-207")!;
+    check("服务端最终汇聚两条决定",
+      serverItem.status === "pending_fix" &&
+      serverItem.conflicts.some((c) => c.metric === "离线标签冲突"));
+  }
+
+  // ───────── H. 旧数据迁移 ─────────
+  console.log("\n[H] v1 旧数据（服务端/客户端快照）仍可读取并升级到 v2");
+  {
+    const kv = memoryKV();
+    // 手工构造 v1 服务端状态（无 rev；processedActions 值为旧的审计 id 形态）
+    const v1 = seedState();
+    const legacy: ReviewState = {
+      version: 1,
+      items: v1.items,
+      processedActions: { "old-act-1": "au-001" },
+    } as unknown as ReviewState;
+    saveState(kv, SERVER_KEY, legacy);
+
+    const loaded = loadState(kv, SERVER_KEY)!;
+    check("旧服务端状态可读取并升级为 version 2 / rev 0",
+      loaded.version === 2 && loaded.rev === 0, loaded);
+    check("旧 processedActions 归一为 actionId 键",
+      loaded.processedActions["old-act-1"] === "old-act-1");
+
+    const server = new MockServer(kv, { latencyMs: 0 });
+    const st = new ReviewStore(server, kv);
+    check("迁移后种子事项数量不丢", st.getView().state.items.length === v1.items.length);
+    check("迁移后旧冲突仍在（rv-032 未关闭冲突）",
+      st.getView().state.items.find((i) => i.id === "rv-032")!.conflicts[0].status === "open");
+
+    // 迁移后新动作可正常落库并自增 rev
+    const r = await st.dispatch(act("to_escalated", doctor, "rv-207", { actionId: "mig-1" }), "m1");
+    check("迁移数据上可继续提交决定", r.ok === true);
+    const after = server.getState();
+    check("提交后 rev 自增、版本保持 2", after.rev === 1 && after.version === 2, after.rev);
+
+    // v1 客户端快照（无 version/outbox/recent）
+    const kv2 = memoryKV();
+    const v1State = {
+      version: 1,
+      items: v1.items,
+      processedActions: {},
+    } as unknown as ReviewState;
+    saveJSON(kv2, CLIENT_KEY, { state: v1State, updatedAt: "2026-09-10T00:00:00.000Z" });
+    const server2 = new MockServer(kv2, { latencyMs: 0 });
+    const st2 = new ReviewStore(server2, kv2);
+    check("无 outbox 的旧客户端快照可恢复，outbox 补空",
+      st2.getView().state.items.length === v1.items.length && st2.getView().outboxCount === 0);
+    const r2 = await st2.dispatch(
+      act("mark_conflict", opt, "rv-207", { actionId: "mig-2", metric: "迁移后新冲突", detail: "ok" }),
+      "m2"
+    );
+    check("迁移后的客户端可正常登记冲突", r2.ok === true);
   }
 
   console.log(`\n结果：${passed} 通过，${failed} 失败\n`);

@@ -1,50 +1,69 @@
 import { applyAction } from "./rules";
 import { seedState } from "./seed";
-import { KV, SETTINGS_KEY, SERVER_KEY, loadJSON, loadState, saveState, saveJSON } from "./storage";
-import type { ReviewAction, ReviewState } from "./types";
+import {
+  KV,
+  SETTINGS_KEY,
+  SERVER_KEY,
+  loadJSON,
+  loadState,
+  saveState,
+  saveJSON,
+  withServerLock,
+} from "./storage";
+import type { DispatchResult, ReviewAction, ReviewState } from "./types";
 import { ReviewError } from "./types";
 
-export interface DispatchResult {
-  state: ReviewState;
-  deduped: boolean; // true = 重复 actionId，未再处理
-}
+let ownerSeq = 0;
 
 /**
- * 模拟后端：自己持有权威状态并持久化（模拟服务端库）。
- * - 网络断开时任何请求都失败（NETWORK_OFFLINE），动作不入库
- * - actionId 在服务端去重，重复提交只生效一次
- * - 刷新页面后状态从持久化层恢复
+ * 模拟后端：权威状态保存在共享 KV（浏览器中即 localStorage，天然跨标签共享）。
+ *
+ * 并发保存：每次 dispatch 在跨标签锁内【重新读取最新状态】→ apply → 写回并自增 rev。
+ * 两个标签页同时提交不同决定时，两者都进入临界区顺序落库，谁也不会覆盖谁。
+ *
+ * 幂等：
+ * - 同一 actionId 只生效一次（断网重放/刷新后重放安全）
+ * - 同事项同指标同说明的未关闭冲突只保留一条（规则引擎内内容级去重）
+ *
+ * 断网：online=false 时请求一律失败，服务端库不变；动作由客户端 outbox 暂存。
  */
 export class MockServer {
-  private state: ReviewState;
   private kv: KV;
+  private owner: string;
   online = true;
   latencyMs: number;
 
   constructor(kv: KV, opts: { latencyMs?: number } = {}) {
     this.kv = kv;
     this.latencyMs = opts.latencyMs ?? 120;
-    const loaded = loadState(kv, SERVER_KEY);
-    this.state = loaded ?? seedState();
-    if (!loaded) saveState(kv, SERVER_KEY, this.state); // 服务端库初始化
+    this.owner = `srv-${++ownerSeq}-${Math.random().toString(36).slice(2, 7)}`;
+
+    if (!loadState(kv, SERVER_KEY)) {
+      saveState(kv, SERVER_KEY, seedState()); // 服务端库初始化（种子为最新结构）
+    }
     this.online = loadJSON<{ online: boolean }>(kv, SETTINGS_KEY)?.online ?? true;
   }
 
+  /** 读取共享库中的权威状态（始终读最新，不缓存） */
   getState(): ReviewState {
-    return this.state;
+    return loadState(this.kv, SERVER_KEY) ?? seedState();
+  }
+
+  isOnline(): boolean {
+    return this.online;
   }
 
   setOnline(online: boolean): void {
     this.online = online;
-    saveJSON(this.kv, SETTINGS_KEY, { online }); // 断网模拟状态跨刷新保持
+    saveJSON(this.kv, SETTINGS_KEY, { online });
   }
 
   reset(): ReviewState {
-    this.state = seedState();
+    const fresh = seedState();
     this.online = true;
-    saveState(this.kv, SERVER_KEY, this.state);
+    saveState(this.kv, SERVER_KEY, fresh);
     saveJSON(this.kv, SETTINGS_KEY, { online: true });
-    return this.state;
+    return fresh;
   }
 
   private delay(): Promise<void> {
@@ -55,18 +74,29 @@ export class MockServer {
   async fetchState(): Promise<ReviewState> {
     await this.delay();
     if (!this.online) throw new ReviewError("NETWORK_OFFLINE", "网络已断开");
-    return this.state;
+    return this.getState();
   }
 
   async dispatch(action: ReviewAction): Promise<DispatchResult> {
     await this.delay();
     if (!this.online) throw new ReviewError("NETWORK_OFFLINE", "网络已断开，动作暂存本地");
 
-    if (this.state.processedActions[action.actionId]) {
-      return { state: this.state, deduped: true };
-    }
-    this.state = applyAction(this.state, action);
-    saveState(this.kv, SERVER_KEY, this.state);
-    return { state: this.state, deduped: false };
+    return withServerLock(this.kv, this.owner, () => {
+      // 临界区内重新读取：拿到的是其它标签刚刚落库的最新状态
+      const current = loadState(this.kv, SERVER_KEY) ?? seedState();
+
+      if (current.processedActions[action.actionId]) {
+        return { state: current, deduped: true };
+      }
+
+      const result = applyAction(current, action);
+      const next: ReviewState = { ...result.state, rev: current.rev + 1 };
+      saveState(this.kv, SERVER_KEY, next);
+      return {
+        state: next,
+        deduped: false,
+        conflictDeduped: result.outcome === "conflict_deduped",
+      };
+    });
   }
 }

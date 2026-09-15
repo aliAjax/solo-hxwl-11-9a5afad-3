@@ -48,6 +48,7 @@ const STATUS_CLASS: Record<string, string> = {
 
 const ACTION_LABEL: Record<ActionType, string> = {
   mark_conflict: "标记冲突",
+  reopen_conflict: "重新开启冲突",
   close_conflict: "关闭冲突",
   to_pending_fix: "转待修正",
   to_escalated: "转需升级",
@@ -202,10 +203,12 @@ function ConflictCard({
   user: User;
 }) {
   const [closing, setClosing] = useState(false);
+  const [reopening, setReopening] = useState(false);
   const [note, setNote] = useState("");
   const open = conflict.status === "open";
 
   const closeDeny = open ? denyReason(item, "close_conflict", user.role) : null;
+  const reopenDeny = !open ? denyReason(item, "reopen_conflict", user.role) : null;
 
   return (
     <article className={`conflict-card ${open ? "open" : "resolved"}`}>
@@ -263,6 +266,47 @@ function ConflictCard({
         </div>
       )}
       {open && closeDeny && <p className="role-hint">{closeDeny}</p>}
+      {!open && can(user.role, "reopen_conflict") && item.status !== "confirmed" && (
+        <div className="conflict-actions">
+          {reopening ? (
+            <>
+              <input
+                placeholder="重新开启原因（可选），如：复查后数据仍矛盾"
+                value={note}
+                onChange={(e) => setNote(e.target.value)}
+              />
+              <button
+                className="small tone-reopen"
+                onClick={() => {
+                  const at = new Date().toISOString();
+                  store.dispatch(
+                    {
+                      actionId: newActionId(),
+                      type: "reopen_conflict",
+                      itemId: item.id,
+                      actor: user,
+                      at,
+                      conflictId: conflict.id,
+                      detail: note,
+                    },
+                    `reopen:${item.id}:${conflict.id}:${Date.now()}`
+                  );
+                  setReopening(false);
+                  setNote("");
+                }}
+              >
+                确认重新开启
+              </button>
+              <button onClick={() => setReopening(false)}>取消</button>
+            </>
+          ) : (
+            <button className="small" onClick={() => setReopening(true)}>
+              重新开启
+            </button>
+          )}
+        </div>
+      )}
+      {!open && reopenDeny && <p className="role-hint">{reopenDeny}</p>}
     </article>
   );
 }

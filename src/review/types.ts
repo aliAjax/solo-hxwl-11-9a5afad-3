@@ -84,6 +84,7 @@ export interface AuditEntry {
 
 export type ActionType =
   | "mark_conflict"
+  | "reopen_conflict"
   | "close_conflict"
   | "to_pending_fix"
   | "to_escalated"
@@ -100,9 +101,11 @@ export interface ReviewItem {
 }
 
 export interface ReviewState {
-  version: 1;
+  version: number; // 数据结构版本（1 = 旧版，2 = 当前）
+  /** 服务端单调修订号，跨标签并发保存用（v1 旧数据迁移时补 0） */
+  rev: number;
   items: ReviewItem[];
-  /** 服务端已处理动作幂等键：actionId -> 对应审计 id */
+  /** 服务端已处理动作幂等键：actionId -> true */
   processedActions: Record<string, string>;
 }
 
@@ -124,7 +127,17 @@ export type ErrorCode =
   | "CONFLICT_OPEN"
   | "ILLEGAL_TRANSITION"
   | "DUPLICATE_ACTION"
+  | "DUPLICATE_CONFLICT" // 同事项已有同指标+同说明的未关闭冲突
+  | "CONFLICT_RESOLVED" // 要求重开的冲突不是已关闭状态
+  | "LOCK_BUSY" // 跨标签保存锁竞争
   | "NETWORK_OFFLINE";
+
+export interface DispatchResult {
+  state: ReviewState;
+  deduped: boolean; // true = 重复 actionId，未再处理
+  /** true = 同指标同说明的未关闭冲突已存在，内容级幂等命中，未产生新记录 */
+  conflictDeduped?: boolean;
+}
 
 export class ReviewError extends Error {
   code: ErrorCode;

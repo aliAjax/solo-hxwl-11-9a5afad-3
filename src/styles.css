@@ -636,6 +636,13 @@ td.cell-alert {
   min-height: 36px;
 }
 
+.tone-reopen {
+  color: #c2410c;
+  border-color: color-mix(in srgb, #ea580c 50%, #fff);
+  background: color-mix(in srgb, #ea580c 10%, #fff);
+  font-weight: 600;
+}
+
 .role-hint,
 .empty-hint {
   margin: 0;
@@ -731,6 +738,7 @@ td.cell-alert {
 
 .kind-confirm .audit-dot { background: var(--accent); }
 .kind-mark_conflict .audit-dot { background: var(--warn); }
+.kind-reopen_conflict .audit-dot { background: #ea580c; }
 .kind-close_conflict .audit-dot { background: #0ea5e9; }
 .kind-to_pending_fix .audit-dot { background: #d97706; }
 .kind-to_escalated .audit-dot { background: #7c3aed; }

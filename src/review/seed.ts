@@ -276,5 +276,5 @@ export function seedState(): ReviewState {
     },
   ];
 
-  return { version: 1, items, processedActions: {} };
+  return { version: 2, rev: 0, items, processedActions: {} };
 }
